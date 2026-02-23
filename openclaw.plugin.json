@@ -1,0 +1,22 @@
+{
+  "id": "openclaw-leuko",
+  "name": "Leuko Health System",
+  "version": "0.1.0",
+  "description": "Cognitive immune system — L2 semantic health checks with LLM analysis, tool exposure for agent queries, and Sitrep replacement",
+  "author": "Vainplex",
+  "license": "MIT",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Enable/disable the leuko plugin entirely"
+      },
+      "configPath": {
+        "type": "string",
+        "description": "Override path to external config file"
+      }
+    }
+  }
+}
