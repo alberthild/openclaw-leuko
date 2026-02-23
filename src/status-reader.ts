@@ -10,10 +10,7 @@ import type {
   LeukoHistory,
   HistorySnapshot,
 } from "./types.js";
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+import { isRecord } from "./check-utils.js";
 
 function parseSeverity(v: unknown): Severity {
   if (v === "ok" || v === "warn" || v === "critical") return v;
@@ -80,6 +77,23 @@ function parseSitrepCollector(raw: unknown): SitrepCollectorResult | null {
   };
 }
 
+function parseFilteredArray<T>(arr: unknown, parser: (v: unknown) => T | null): T[] | undefined {
+  if (!Array.isArray(arr)) return undefined;
+  return (arr as unknown[]).map(parser).filter((x): x is T => x !== null);
+}
+
+function parseStatusObject(raw: Record<string, unknown>): LeukoStatus {
+  return {
+    last_check: typeof raw["last_check"] === "string" ? raw["last_check"] : "",
+    overall_severity: parseSeverity(raw["overall_severity"]),
+    daemon_checks: parseFilteredArray(raw["daemon_checks"], parseDaemonCheck) ?? [],
+    auto_heal_history: Array.isArray(raw["auto_heal_history"]) ? raw["auto_heal_history"] : undefined,
+    cognitive_checks: parseFilteredArray(raw["cognitive_checks"], parseCognitiveCheck),
+    cognitive_meta: parseCognitiveMeta(raw["cognitive_meta"]),
+    sitrep_collectors: parseFilteredArray(raw["sitrep_collectors"], parseSitrepCollector),
+  };
+}
+
 export function readStatusFile(path: string, logger?: PluginLogger): LeukoStatus | null {
   try {
     if (!existsSync(path)) {
@@ -92,33 +106,9 @@ export function readStatusFile(path: string, logger?: PluginLogger): LeukoStatus
       logger?.warn(`[leuko] Status file is not an object: ${path}`);
       return null;
     }
-    return {
-      last_check: typeof raw["last_check"] === "string" ? raw["last_check"] : "",
-      overall_severity: parseSeverity(raw["overall_severity"]),
-      daemon_checks: Array.isArray(raw["daemon_checks"])
-        ? (raw["daemon_checks"] as unknown[])
-            .map(parseDaemonCheck)
-            .filter((c): c is DaemonCheck => c !== null)
-        : [],
-      auto_heal_history: Array.isArray(raw["auto_heal_history"])
-        ? raw["auto_heal_history"]
-        : undefined,
-      cognitive_checks: Array.isArray(raw["cognitive_checks"])
-        ? (raw["cognitive_checks"] as unknown[])
-            .map(parseCognitiveCheck)
-            .filter((c): c is CognitiveCheckResult => c !== null)
-        : undefined,
-      cognitive_meta: parseCognitiveMeta(raw["cognitive_meta"]),
-      sitrep_collectors: Array.isArray(raw["sitrep_collectors"])
-        ? (raw["sitrep_collectors"] as unknown[])
-            .map(parseSitrepCollector)
-            .filter((c): c is SitrepCollectorResult => c !== null)
-        : undefined,
-    };
+    return parseStatusObject(raw);
   } catch (e) {
-    logger?.warn(
-      `[leuko] Failed to read status file: ${e instanceof Error ? e.message : String(e)}`,
-    );
+    logger?.warn(`[leuko] Failed to read status file: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
 }

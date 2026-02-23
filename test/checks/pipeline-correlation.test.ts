@@ -8,7 +8,7 @@ import type {
 
 // Mock child_process and fs
 vi.mock("node:child_process", () => ({
-  execSync: vi.fn(),
+  execFileSync: vi.fn(),
 }));
 
 vi.mock("node:fs", () => ({
@@ -17,10 +17,10 @@ vi.mock("node:fs", () => ({
   readFileSync: vi.fn(),
 }));
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { statSync, existsSync } from "node:fs";
 
-const mockedExecSync = vi.mocked(execSync);
+const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedStatSync = vi.mocked(statSync);
 const mockedExistsSync = vi.mocked(existsSync);
 
@@ -51,7 +51,7 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("returns ok when all signals normal", () => {
-    mockedExecSync.mockImplementation(() => {
+    mockedExecFileSync.mockImplementation(() => {
       throw new Error("nats not found");
     });
     mockedExistsSync.mockReturnValue(true);
@@ -68,7 +68,7 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("detects consumer_disconnected when threads stale with NATS events", () => {
-    mockedExecSync.mockReturnValue(
+    mockedExecFileSync.mockReturnValue(
       JSON.stringify({ state: { messages: 100 } }),
     );
     mockedExistsSync.mockReturnValue(true);
@@ -85,7 +85,7 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("detects consumer_slow when threads slightly stale", () => {
-    mockedExecSync.mockReturnValue(
+    mockedExecFileSync.mockReturnValue(
       JSON.stringify({ state: { messages: 50 } }),
     );
     mockedExistsSync.mockReturnValue(true);
@@ -101,7 +101,7 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("detects pipeline_disconnected when crons ok but outputs stale", () => {
-    mockedExecSync.mockImplementation(() => {
+    mockedExecFileSync.mockImplementation(() => {
       throw new Error("no nats");
     });
     mockedExistsSync.mockReturnValue(true);
@@ -123,7 +123,7 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("detects event_source_silent when NATS has 0 messages during business hours", () => {
-    mockedExecSync.mockReturnValue(JSON.stringify({ state: { messages: 0 } }));
+    mockedExecFileSync.mockReturnValue(JSON.stringify({ state: { messages: 0 } }));
     mockedExistsSync.mockReturnValue(true);
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() } as ReturnType<typeof statSync>);
 
@@ -140,7 +140,7 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("handles NATS CLI not available gracefully", () => {
-    mockedExecSync.mockImplementation(() => {
+    mockedExecFileSync.mockImplementation(() => {
       throw new Error("command not found");
     });
     mockedExistsSync.mockReturnValue(true);
@@ -156,7 +156,7 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("records duration_ms and timestamp", () => {
-    mockedExecSync.mockImplementation(() => {
+    mockedExecFileSync.mockImplementation(() => {
       throw new Error("no nats");
     });
     mockedExistsSync.mockReturnValue(true);

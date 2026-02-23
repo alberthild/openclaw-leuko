@@ -6,10 +6,7 @@ import type {
   SitrepCollectorResult,
   PluginLogger,
 } from "./types.js";
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+import { isRecord } from "./check-utils.js";
 
 export interface WritePayload {
   cognitive_checks: CognitiveCheckResult[];

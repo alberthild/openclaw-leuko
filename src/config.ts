@@ -9,6 +9,7 @@ import type {
   PluginLogger,
   CustomCollectorEntry,
 } from "./types.js";
+import { isRecord } from "./check-utils.js";
 
 // ============================================================
 // Defaults
@@ -141,24 +142,38 @@ function resolveLlmConfig(raw: Record<string, unknown>): LlmConfig {
   };
 }
 
+function resolveMonitoredDirs(ad: Record<string, unknown>): ChecksConfig["anomaly_detection"]["monitoredDirs"] {
+  if (!Array.isArray(ad["monitoredDirs"])) return [...DEFAULTS.checks.anomaly_detection.monitoredDirs];
+  return (ad["monitoredDirs"] as unknown[]).filter(
+    (d): d is { path: string; label: string } =>
+      typeof d === "object" && d !== null &&
+      typeof (d as Record<string, unknown>)["path"] === "string" &&
+      typeof (d as Record<string, unknown>)["label"] === "string",
+  );
+}
+
+function resolvePipelineCorrelation(pc: Record<string, unknown>): ChecksConfig["pipeline_correlation"] {
+  const bh = rec(pc["businessHours"]);
+  const def = DEFAULTS.checks.pipeline_correlation;
+  return {
+    enabled: bool(pc["enabled"], def.enabled),
+    usesLlm: bool(pc["usesLlm"], def.usesLlm),
+    natsStream: str(pc["natsStream"], def.natsStream),
+    correlationWindowHours: int(pc["correlationWindowHours"], def.correlationWindowHours),
+    businessHours: {
+      start: int(bh["start"], def.businessHours.start),
+      end: int(bh["end"], def.businessHours.end),
+      tz: str(bh["tz"], def.businessHours.tz),
+    },
+  };
+}
+
 function resolveChecksConfig(raw: Record<string, unknown>): ChecksConfig {
   const gq = rec(raw["goal_quality"]);
   const th = rec(raw["thread_health"]);
-  const pc = rec(raw["pipeline_correlation"]);
   const ad = rec(raw["anomaly_detection"]);
   const bi = rec(raw["bootstrap_integrity"]);
   const rm = rec(raw["recommendations"]);
-  const bh = rec(pc["businessHours"]);
-
-  const monitoredDirs = Array.isArray(ad["monitoredDirs"])
-    ? (ad["monitoredDirs"] as unknown[]).filter(
-        (d): d is { path: string; label: string } =>
-          typeof d === "object" &&
-          d !== null &&
-          typeof (d as Record<string, unknown>)["path"] === "string" &&
-          typeof (d as Record<string, unknown>)["label"] === "string",
-      )
-    : [...DEFAULTS.checks.anomaly_detection.monitoredDirs];
 
   return {
     goal_quality: {
@@ -172,24 +187,11 @@ function resolveChecksConfig(raw: Record<string, unknown>): ChecksConfig {
       usesLlm: bool(th["usesLlm"], DEFAULTS.checks.thread_health.usesLlm),
       staleDays: int(th["staleDays"], DEFAULTS.checks.thread_health.staleDays),
     },
-    pipeline_correlation: {
-      enabled: bool(pc["enabled"], DEFAULTS.checks.pipeline_correlation.enabled),
-      usesLlm: bool(pc["usesLlm"], DEFAULTS.checks.pipeline_correlation.usesLlm),
-      natsStream: str(pc["natsStream"], DEFAULTS.checks.pipeline_correlation.natsStream),
-      correlationWindowHours: int(
-        pc["correlationWindowHours"],
-        DEFAULTS.checks.pipeline_correlation.correlationWindowHours,
-      ),
-      businessHours: {
-        start: int(bh["start"], DEFAULTS.checks.pipeline_correlation.businessHours.start),
-        end: int(bh["end"], DEFAULTS.checks.pipeline_correlation.businessHours.end),
-        tz: str(bh["tz"], DEFAULTS.checks.pipeline_correlation.businessHours.tz),
-      },
-    },
+    pipeline_correlation: resolvePipelineCorrelation(rec(raw["pipeline_correlation"])),
     anomaly_detection: {
       enabled: bool(ad["enabled"], DEFAULTS.checks.anomaly_detection.enabled),
       usesLlm: bool(ad["usesLlm"], DEFAULTS.checks.anomaly_detection.usesLlm),
-      monitoredDirs,
+      monitoredDirs: resolveMonitoredDirs(ad),
     },
     bootstrap_integrity: {
       enabled: bool(bi["enabled"], DEFAULTS.checks.bootstrap_integrity.enabled),
@@ -267,10 +269,6 @@ const DEFAULT_CONFIG_DIR = join(
   "openclaw-leuko",
 );
 const DEFAULT_CONFIG_FILENAME = "config.json";
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
 
 function isLegacyInlineConfig(raw: Record<string, unknown>): boolean {
   const inlineOnlyKeys = new Set(["enabled", "configPath"]);

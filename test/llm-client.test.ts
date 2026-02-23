@@ -165,13 +165,13 @@ describe("LlmClient", () => {
     servers.push(server);
 
     const client = createLlmClient(
-      { ...primaryConfig, baseUrl: `http://127.0.0.1:${port}`, apiKey: "sk-test-key" },
+      { ...primaryConfig, baseUrl: `http://127.0.0.1:${port}`, apiKey: "test-api-key-12345" },
       fallbackConfig,
       mockLogger(),
     );
 
     await client.generate("system", "user", 5000);
-    expect(receivedAuth).toBe("Bearer sk-test-key");
+    expect(receivedAuth).toBe("Bearer test-api-key-12345");
   });
 
   it("records duration across both attempts", async () => {

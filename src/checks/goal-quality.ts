@@ -5,9 +5,11 @@ import type {
   LlmClient,
   PendingGoal,
   PluginLogger,
-  Severity,
 } from "../types.js";
 import { readJsonInput } from "../status-reader.js";
+import { parseSeverityString, worstSeverity } from "../check-utils.js";
+import { runLlmCheck } from "../check-runner.js";
+import type { MergeOpts } from "../check-runner.js";
 
 const CHECK_NAME = "cognitive:goal_quality";
 
@@ -40,56 +42,50 @@ interface GoalsData {
   pending_goals?: PendingGoal[];
 }
 
-function isGoalsArray(v: unknown): v is PendingGoal[] {
-  return Array.isArray(v);
-}
-
 function extractGoals(data: unknown): PendingGoal[] {
   if (Array.isArray(data)) return data as PendingGoal[];
   if (typeof data === "object" && data !== null) {
     const obj = data as GoalsData;
-    if (isGoalsArray(obj.goals)) return obj.goals;
-    if (isGoalsArray(obj.pending_goals)) return obj.pending_goals;
+    if (Array.isArray(obj.goals)) return obj.goals;
+    if (Array.isArray(obj.pending_goals)) return obj.pending_goals;
   }
   return [];
 }
 
-/**
- * Pre-filter: flag obvious issues without LLM (adopted from Sitrep goals collector).
- */
 function preFilterGoals(goals: PendingGoal[]): CheckFinding[] {
   const findings: CheckFinding[] = [];
   const now = Date.now();
-
   for (const goal of goals) {
-    // Expired goals
-    if (goal.expires) {
-      const expiryMs = new Date(goal.expires).getTime();
-      if (!isNaN(expiryMs) && expiryMs < now) {
-        findings.push({
-          item_id: goal.id,
-          issue: "expired",
-          detail: `Goal "${goal.title}" expired on ${goal.expires}`,
-          recommendation: "Remove or renew this goal",
-        });
-      }
-    }
-
-    // Goals proposed > 48h ago and not yet approved
-    if (goal.proposed_at && goal.status === "proposed") {
-      const proposedMs = new Date(goal.proposed_at).getTime();
-      if (!isNaN(proposedMs) && now - proposedMs > 48 * 60 * 60 * 1000) {
-        findings.push({
-          item_id: goal.id,
-          issue: "stale_proposal",
-          detail: `Goal "${goal.title}" proposed ${Math.round((now - proposedMs) / 3600000)}h ago, still not approved`,
-          recommendation: "Review and approve or reject this goal",
-        });
-      }
-    }
+    checkExpired(goal, now, findings);
+    checkStaleProposal(goal, now, findings);
   }
-
   return findings;
+}
+
+function checkExpired(goal: PendingGoal, now: number, out: CheckFinding[]): void {
+  if (!goal.expires) return;
+  const expiryMs = new Date(goal.expires).getTime();
+  if (!isNaN(expiryMs) && expiryMs < now) {
+    out.push({
+      item_id: goal.id,
+      issue: "expired",
+      detail: `Goal "${goal.title}" expired on ${goal.expires}`,
+      recommendation: "Remove or renew this goal",
+    });
+  }
+}
+
+function checkStaleProposal(goal: PendingGoal, now: number, out: CheckFinding[]): void {
+  if (!goal.proposed_at || goal.status !== "proposed") return;
+  const proposedMs = new Date(goal.proposed_at).getTime();
+  if (!isNaN(proposedMs) && now - proposedMs > 48 * 60 * 60 * 1000) {
+    out.push({
+      item_id: goal.id,
+      issue: "stale_proposal",
+      detail: `Goal "${goal.title}" proposed ${Math.round((now - proposedMs) / 3600000)}h ago, still not approved`,
+      recommendation: "Review and approve or reject this goal",
+    });
+  }
 }
 
 interface LlmGoalResponse {
@@ -103,87 +99,7 @@ interface LlmGoalResponse {
   }>;
 }
 
-function parseLlmResponse(raw: string): LlmGoalResponse | null {
-  try {
-    return JSON.parse(raw) as LlmGoalResponse;
-  } catch {
-    return null;
-  }
-}
-
-export async function runGoalQualityCheck(
-  config: GoalQualityCheckConfig,
-  llm: LlmClient,
-  logger: PluginLogger,
-): Promise<CognitiveCheckResult> {
-  const startMs = Date.now();
-  const timestamp = new Date().toISOString();
-
-  // Read goals file
-  const rawData = readJsonInput<unknown>(config.inputPath, logger);
-  if (rawData === null) {
-    return {
-      check_name: CHECK_NAME,
-      severity: "ok",
-      detail: "Goals file not found — check skipped",
-      timestamp,
-      duration_ms: Date.now() - startMs,
-    };
-  }
-
-  const goals = extractGoals(rawData);
-  if (goals.length === 0) {
-    return {
-      check_name: CHECK_NAME,
-      severity: "ok",
-      detail: "No pending goals found",
-      timestamp,
-      duration_ms: Date.now() - startMs,
-    };
-  }
-
-  // Pre-filter
-  const preFindings = preFilterGoals(goals);
-
-  // LLM analysis
-  const goalsText = JSON.stringify(goals, null, 2).substring(0, 4000);
-  const userPrompt = `Current date: ${new Date().toISOString().split("T")[0]}\n\nPending goals (${goals.length} total):\n${goalsText}`;
-
-  const llmResult = await llm.generate(SYSTEM_PROMPT, userPrompt, 30000);
-
-  if (llmResult.content === null) {
-    // Fail-open: use pre-filter results only
-    const severity: Severity = preFindings.length > 0 ? "warn" : "ok";
-    return {
-      check_name: CHECK_NAME,
-      severity,
-      detail: llmResult.error
-        ? `LLM unavailable (${llmResult.error}) — ${preFindings.length} pre-filter findings`
-        : `LLM timeout — ${preFindings.length} pre-filter findings`,
-      findings: preFindings,
-      timestamp,
-      model_used: llmResult.model,
-      tokens_used: 0,
-      duration_ms: Date.now() - startMs,
-    };
-  }
-
-  const parsed = parseLlmResponse(llmResult.content);
-  if (!parsed) {
-    const severity: Severity = preFindings.length > 0 ? "warn" : "ok";
-    return {
-      check_name: CHECK_NAME,
-      severity,
-      detail: `LLM response parsing failed — ${preFindings.length} pre-filter findings`,
-      findings: preFindings,
-      timestamp,
-      model_used: llmResult.model,
-      tokens_used: llmResult.tokens,
-      duration_ms: Date.now() - startMs,
-    };
-  }
-
-  // Merge pre-filter + LLM findings
+function mergeLlmFindings(preFindings: CheckFinding[], parsed: LlmGoalResponse): CheckFinding[] {
   const llmFindings: CheckFinding[] = Array.isArray(parsed.findings)
     ? parsed.findings.map((f) => ({
         item_id: typeof f.item_id === "string" ? f.item_id : undefined,
@@ -192,34 +108,72 @@ export async function runGoalQualityCheck(
         recommendation: typeof f.recommendation === "string" ? f.recommendation : undefined,
       }))
     : [];
-
-  // Deduplicate by item_id
   const seenIds = new Set(preFindings.map((f) => f.item_id).filter(Boolean));
-  const uniqueLlmFindings = llmFindings.filter((f) => !f.item_id || !seenIds.has(f.item_id));
-  const allFindings = [...preFindings, ...uniqueLlmFindings];
-
-  const llmSeverity = parseSeverityString(parsed.severity);
-  const preSeverity: Severity = preFindings.length > 0 ? "warn" : "ok";
-  const severity = worstSeverity(llmSeverity, preSeverity);
-
-  return {
-    check_name: CHECK_NAME,
-    severity,
-    detail: typeof parsed.detail === "string" ? parsed.detail : `${allFindings.length} findings`,
-    findings: allFindings,
-    timestamp,
-    model_used: llmResult.model,
-    tokens_used: llmResult.tokens,
-    duration_ms: Date.now() - startMs,
-  };
+  const unique = llmFindings.filter((f) => !f.item_id || !seenIds.has(f.item_id));
+  return [...preFindings, ...unique];
 }
 
-function parseSeverityString(v: unknown): Severity {
-  if (v === "ok" || v === "warn" || v === "critical") return v;
-  return "ok";
-}
+export async function runGoalQualityCheck(
+  config: GoalQualityCheckConfig,
+  llm: LlmClient,
+  logger: PluginLogger,
+): Promise<CognitiveCheckResult> {
+  return runLlmCheck<PendingGoal[], LlmGoalResponse>({
+    name: CHECK_NAME,
+    systemPrompt: SYSTEM_PROMPT,
+    llm,
+    logger,
 
-function worstSeverity(a: Severity, b: Severity): Severity {
-  const order: Record<Severity, number> = { ok: 0, warn: 1, critical: 2 };
-  return order[a] >= order[b] ? a : b;
+    readInput(timestamp, startMs) {
+      const rawData = readJsonInput<unknown>(config.inputPath, logger);
+      if (rawData === null) {
+        return { ok: false, skip: { check_name: CHECK_NAME, severity: "ok", detail: "Goals file not found — check skipped", timestamp, duration_ms: Date.now() - startMs } };
+      }
+      const goals = extractGoals(rawData);
+      if (goals.length === 0) {
+        return { ok: false, skip: { check_name: CHECK_NAME, severity: "ok", detail: "No pending goals found", timestamp, duration_ms: Date.now() - startMs } };
+      }
+      return { ok: true, input: goals };
+    },
+
+    preFilter(goals) {
+      const findings = preFilterGoals(goals);
+      return { severity: findings.length > 0 ? "warn" : "ok", findingCount: findings.length, data: { findings } };
+    },
+
+    buildPrompt(goals) {
+      const goalsText = JSON.stringify(goals, null, 2).substring(0, 4000);
+      return `Current date: ${new Date().toISOString().split("T")[0]}\n\nPending goals (${goals.length} total):\n${goalsText}`;
+    },
+
+    buildFailOpen({ pre, message, llmModel, llmTokens, timestamp, startMs }) {
+      const preFindings = pre.data["findings"] as CheckFinding[];
+      return {
+        check_name: CHECK_NAME,
+        severity: pre.severity,
+        detail: `${message} — ${pre.findingCount} pre-filter findings`,
+        findings: preFindings,
+        timestamp,
+        model_used: llmModel,
+        tokens_used: llmTokens,
+        duration_ms: Date.now() - startMs,
+      };
+    },
+
+    mergeResults(opts: MergeOpts<LlmGoalResponse>) {
+      const preFindings = opts.pre.data["findings"] as CheckFinding[];
+      const allFindings = mergeLlmFindings(preFindings, opts.parsed);
+      const severity = worstSeverity(parseSeverityString(opts.parsed.severity), opts.pre.severity);
+      return {
+        check_name: CHECK_NAME,
+        severity,
+        detail: typeof opts.parsed.detail === "string" ? opts.parsed.detail : `${allFindings.length} findings`,
+        findings: allFindings,
+        timestamp: opts.timestamp,
+        model_used: opts.llmModel,
+        tokens_used: opts.llmTokens,
+        duration_ms: Date.now() - opts.startMs,
+      };
+    },
+  });
 }

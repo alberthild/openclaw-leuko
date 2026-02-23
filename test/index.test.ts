@@ -13,7 +13,7 @@ vi.mock("node:fs", () => ({
 }));
 
 vi.mock("node:child_process", () => ({
-  execSync: vi.fn().mockImplementation(() => { throw new Error("no nats"); }),
+  execFileSync: vi.fn().mockImplementation(() => { throw new Error("no nats"); }),
 }));
 
 function mockLogger(): PluginLogger {

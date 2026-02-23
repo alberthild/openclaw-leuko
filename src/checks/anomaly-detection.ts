@@ -11,9 +11,6 @@ import type {
 
 const CHECK_NAME = "cognitive:anomaly_detection";
 
-/**
- * Get total size of a directory in MB.
- */
 function getDirSizeMb(dirPath: string): number | null {
   try {
     if (!existsSync(dirPath)) return null;
@@ -21,14 +18,8 @@ function getDirSizeMb(dirPath: string): number | null {
     const entries = readdirSync(dirPath, { withFileTypes: true });
     for (const entry of entries) {
       try {
-        const fullPath = join(dirPath, entry.name);
-        if (entry.isFile()) {
-          totalBytes += statSync(fullPath).size;
-        }
-        // Don't recurse deep to keep it fast
-      } catch {
-        // Skip inaccessible files
-      }
+        if (entry.isFile()) totalBytes += statSync(join(dirPath, entry.name)).size;
+      } catch { /* skip inaccessible */ }
     }
     return Math.round((totalBytes / (1024 * 1024)) * 100) / 100;
   } catch {
@@ -36,47 +27,85 @@ function getDirSizeMb(dirPath: string): number | null {
   }
 }
 
-/**
- * Check for consecutive same-direction metric trends.
- */
-function detectTrends(
-  history: LeukoHistory | null,
-  metricName: string,
-): { consecutive: number; direction: "growing" | "shrinking" | "stable" } {
-  if (!history || history.snapshots.length < 3) {
-    return { consecutive: 0, direction: "stable" };
-  }
+interface TrendResult { consecutive: number; direction: "growing" | "shrinking" | "stable" }
 
+function detectTrends(history: LeukoHistory | null, metricName: string): TrendResult {
+  if (!history || history.snapshots.length < 3) return { consecutive: 0, direction: "stable" };
   const values = history.snapshots
     .filter((s) => typeof s.metrics[metricName] === "number")
     .map((s) => s.metrics[metricName]!);
-
   if (values.length < 3) return { consecutive: 0, direction: "stable" };
+  return computeConsecutiveTrend(values);
+}
 
-  let consecutiveUp = 0;
-  let consecutiveDown = 0;
-
+function computeConsecutiveTrend(values: number[]): TrendResult {
+  let up = 0;
+  let down = 0;
   for (let i = values.length - 1; i > 0; i--) {
     const prev = values[i - 1]!;
     const curr = values[i]!;
-    if (curr > prev) {
-      consecutiveUp++;
-      consecutiveDown = 0;
-    } else if (curr < prev) {
-      consecutiveDown++;
-      consecutiveUp = 0;
-    } else {
-      break;
-    }
+    if (curr > prev) { up++; down = 0; }
+    else if (curr < prev) { down++; up = 0; }
+    else break;
   }
-
-  if (consecutiveDown >= 3) return { consecutive: consecutiveDown, direction: "shrinking" };
-  if (consecutiveUp >= 3) return { consecutive: consecutiveUp, direction: "growing" };
+  if (down >= 3) return { consecutive: down, direction: "shrinking" };
+  if (up >= 3) return { consecutive: up, direction: "growing" };
   return { consecutive: 0, direction: "stable" };
 }
 
-function severityFromAnomaly(entry: AnomalyEntry): Severity {
-  return entry.severity;
+function checkDirSizes(
+  config: AnomalyDetectionCheckConfig,
+  history: LeukoHistory | null,
+  baselines: Record<string, number>,
+  anomalies: AnomalyEntry[],
+): void {
+  for (const dir of config.monitoredDirs) {
+    const resolved = dir.path.replace(/^~/, process.env["HOME"] ?? "/tmp");
+    const currentMb = getDirSizeMb(resolved);
+    if (currentMb === null) continue;
+    baselines[`${dir.label}_dir_mb`] = currentMb;
+    checkGrowthAnomaly(dir.label, currentMb, history, anomalies);
+  }
+}
+
+function checkGrowthAnomaly(
+  label: string, currentMb: number,
+  history: LeukoHistory | null, anomalies: AnomalyEntry[],
+): void {
+  if (!history || history.snapshots.length === 0) return;
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const snap = history.snapshots.find((s) => {
+    const ts = new Date(s.timestamp).getTime();
+    return !isNaN(ts) && ts < weekAgo;
+  });
+  if (!snap) return;
+  const baselineMb = snap.metrics[`${label}_dir_mb`];
+  if (typeof baselineMb !== "number" || baselineMb <= 0) return;
+  const ratio = currentMb / baselineMb;
+  if (ratio > 5) {
+    anomalies.push({ metric: `${label}_dir_mb`, current: currentMb, baseline: baselineMb, deviation: `${ratio.toFixed(1)}x growth in 7 days`, severity: "critical" });
+  } else if (ratio > 2) {
+    anomalies.push({ metric: `${label}_dir_mb`, current: currentMb, baseline: baselineMb, deviation: `${ratio.toFixed(1)}x growth in 7 days`, severity: "warn" });
+  }
+}
+
+function checkMetricTrends(history: LeukoHistory | null, anomalies: AnomalyEntry[]): void {
+  const tracked = ["fact_count", "goal_count", "thread_count"];
+  for (const metric of tracked) {
+    const trend = detectTrends(history, metric);
+    if (trend.direction !== "shrinking" || trend.consecutive < 3) continue;
+    const severity: Severity = trend.consecutive >= 5 ? "critical" : "warn";
+    const deviation = trend.consecutive >= 5
+      ? `${trend.consecutive} consecutive decreases — possible data loss`
+      : `${trend.consecutive} consecutive decreases`;
+    anomalies.push({ metric, current: trend.consecutive, baseline: 0, deviation, severity });
+  }
+}
+
+function overallSeverity(anomalies: AnomalyEntry[]): Severity {
+  if (anomalies.some((a) => a.severity === "critical")) return "critical";
+  if (anomalies.some((a) => a.severity === "warn")) return "warn";
+  return "ok";
 }
 
 export function runAnomalyDetectionCheck(
@@ -89,91 +118,16 @@ export function runAnomalyDetectionCheck(
   const anomalies: AnomalyEntry[] = [];
   const baselines: Record<string, number> = {};
 
-  // Check directory sizes
-  for (const dir of config.monitoredDirs) {
-    const resolvedPath = dir.path.replace(/^~/, process.env["HOME"] ?? "/tmp");
-    const currentMb = getDirSizeMb(resolvedPath);
-    if (currentMb !== null) {
-      baselines[`${dir.label}_dir_mb`] = currentMb;
+  checkDirSizes(config, history, baselines, anomalies);
+  checkMetricTrends(history, anomalies);
 
-      // Compare to historical baseline if available
-      if (history && history.snapshots.length > 0) {
-        // Get baseline from ~7 days ago
-        const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-        const baselineSnapshot = history.snapshots.find((s) => {
-          const ts = new Date(s.timestamp).getTime();
-          return !isNaN(ts) && ts < weekAgo;
-        });
-
-        if (baselineSnapshot) {
-          const baselineMb = baselineSnapshot.metrics[`${dir.label}_dir_mb`];
-          if (typeof baselineMb === "number" && baselineMb > 0) {
-            const ratio = currentMb / baselineMb;
-            if (ratio > 5) {
-              anomalies.push({
-                metric: `${dir.label}_dir_mb`,
-                current: currentMb,
-                baseline: baselineMb,
-                deviation: `${ratio.toFixed(1)}x growth in 7 days`,
-                severity: "critical",
-              });
-            } else if (ratio > 2) {
-              anomalies.push({
-                metric: `${dir.label}_dir_mb`,
-                current: currentMb,
-                baseline: baselineMb,
-                deviation: `${ratio.toFixed(1)}x growth in 7 days`,
-                severity: "warn",
-              });
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Check metric trends
-  const trackedMetrics = ["fact_count", "goal_count", "thread_count"];
-  for (const metric of trackedMetrics) {
-    const trend = detectTrends(history, metric);
-    if (trend.direction === "shrinking" && trend.consecutive >= 5) {
-      anomalies.push({
-        metric,
-        current: trend.consecutive,
-        baseline: 0,
-        deviation: `${trend.consecutive} consecutive decreases — possible data loss`,
-        severity: "critical",
-      });
-    } else if (trend.direction === "shrinking" && trend.consecutive >= 3) {
-      anomalies.push({
-        metric,
-        current: trend.consecutive,
-        baseline: 0,
-        deviation: `${trend.consecutive} consecutive decreases`,
-        severity: "warn",
-      });
-    }
-  }
-
-  // Determine overall severity
-  let severity: Severity = "ok";
-  for (const a of anomalies) {
-    const s = severityFromAnomaly(a);
-    if (s === "critical") {
-      severity = "critical";
-      break;
-    }
-    if (s === "warn") severity = "warn";
-  }
-
-  const detail =
-    anomalies.length === 0
-      ? "All metrics within normal range"
-      : `${anomalies.length} anomaly(s) detected`;
+  const detail = anomalies.length === 0
+    ? "All metrics within normal range"
+    : `${anomalies.length} anomaly(s) detected`;
 
   return {
     check_name: CHECK_NAME,
-    severity,
+    severity: overallSeverity(anomalies),
     detail,
     anomalies,
     baselines,

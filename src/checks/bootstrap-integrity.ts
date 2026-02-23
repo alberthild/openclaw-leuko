@@ -5,9 +5,11 @@ import type {
   LlmClient,
   LeukoStatus,
   PluginLogger,
-  Severity,
 } from "../types.js";
 import { readTextInput } from "../status-reader.js";
+import { parseSeverityString } from "../check-utils.js";
+import { runLlmCheck } from "../check-runner.js";
+import type { MergeOpts } from "../check-runner.js";
 
 const CHECK_NAME = "cognitive:bootstrap_integrity";
 
@@ -46,30 +48,12 @@ interface LlmBootstrapResponse {
   }>;
 }
 
-function parseLlmResponse(raw: string): LlmBootstrapResponse | null {
-  try {
-    return JSON.parse(raw) as LlmBootstrapResponse;
-  } catch {
-    return null;
-  }
-}
-
-function parseSeverityString(v: unknown): Severity {
-  if (v === "ok" || v === "warn" || v === "critical") return v;
-  return "ok";
-}
-
-/**
- * Build a system context summary from leuko-status for the LLM.
- */
 function buildSystemContext(status: LeukoStatus | null): string {
   if (!status) return "System status: unavailable";
-
   const daemonSummary = status.daemon_checks
     .filter((c) => c.severity !== "ok")
     .map((c) => `${c.check_name}: ${c.severity} — ${c.detail}`)
     .join("\n");
-
   return [
     `Last check: ${status.last_check}`,
     `Overall severity: ${status.overall_severity}`,
@@ -78,84 +62,80 @@ function buildSystemContext(status: LeukoStatus | null): string {
   ].join("\n");
 }
 
+function parseFindings(parsed: LlmBootstrapResponse): CheckFinding[] {
+  if (!Array.isArray(parsed.findings)) return [];
+  return parsed.findings.map((f) => ({
+    issue: typeof f.issue === "string" ? f.issue : "unknown",
+    line: typeof f.line === "string" ? f.line : undefined,
+    detail: typeof f.detail === "string" ? f.detail : "",
+    recommendation: typeof f.recommendation === "string" ? f.recommendation : undefined,
+  }));
+}
+
+interface BootstrapInput { content: string; systemContext: string }
+
 export async function runBootstrapIntegrityCheck(
   config: BootstrapIntegrityCheckConfig,
   llm: LlmClient,
   status: LeukoStatus | null,
   logger: PluginLogger,
 ): Promise<CognitiveCheckResult> {
-  const startMs = Date.now();
-  const timestamp = new Date().toISOString();
+  return runLlmCheck<BootstrapInput, LlmBootstrapResponse>({
+    name: CHECK_NAME,
+    systemPrompt: SYSTEM_PROMPT,
+    llm,
+    logger,
 
-  const bootstrapContent = readTextInput(config.inputPath, 4000, logger);
-  if (bootstrapContent === null) {
-    return {
-      check_name: CHECK_NAME,
-      severity: "warn",
-      detail: "BOOTSTRAP.md not found — cannot verify integrity",
-      timestamp,
-      duration_ms: Date.now() - startMs,
-    };
-  }
+    readInput(timestamp, startMs) {
+      const content = readTextInput(config.inputPath, 4000, logger);
+      if (content === null) {
+        return { ok: false, skip: { check_name: CHECK_NAME, severity: "warn", detail: "BOOTSTRAP.md not found — cannot verify integrity", timestamp, duration_ms: Date.now() - startMs } };
+      }
+      return { ok: true, input: { content, systemContext: buildSystemContext(status) } };
+    },
 
-  const systemContext = buildSystemContext(status);
+    preFilter() {
+      return { severity: "ok", findingCount: 0, data: {} };
+    },
 
-  const userPrompt = [
-    `Current date: ${new Date().toISOString().split("T")[0]}`,
-    "",
-    "=== System State ===",
-    systemContext,
-    "",
-    "=== BOOTSTRAP.md Content ===",
-    bootstrapContent,
-  ].join("\n");
+    buildPrompt(input) {
+      return [
+        `Current date: ${new Date().toISOString().split("T")[0]}`,
+        "",
+        "=== System State ===",
+        input.systemContext,
+        "",
+        "=== BOOTSTRAP.md Content ===",
+        input.content,
+      ].join("\n");
+    },
 
-  const llmResult = await llm.generate(SYSTEM_PROMPT, userPrompt, 30000);
+    buildFailOpen({ message, llmModel, llmTokens, timestamp, startMs }) {
+      return {
+        check_name: CHECK_NAME,
+        severity: "ok",
+        detail: `${message} — check skipped`,
+        timestamp,
+        model_used: llmModel,
+        tokens_used: llmTokens,
+        duration_ms: Date.now() - startMs,
+      };
+    },
 
-  if (llmResult.content === null) {
-    return {
-      check_name: CHECK_NAME,
-      severity: "ok",
-      detail: llmResult.error
-        ? `LLM unavailable (${llmResult.error}) — check skipped`
-        : "LLM timeout — check skipped",
-      timestamp,
-      model_used: llmResult.model,
-      tokens_used: 0,
-      duration_ms: Date.now() - startMs,
-    };
-  }
-
-  const parsed = parseLlmResponse(llmResult.content);
-  if (!parsed) {
-    return {
-      check_name: CHECK_NAME,
-      severity: "ok",
-      detail: "LLM response parsing failed — check skipped",
-      timestamp,
-      model_used: llmResult.model,
-      tokens_used: llmResult.tokens,
-      duration_ms: Date.now() - startMs,
-    };
-  }
-
-  const findings: CheckFinding[] = Array.isArray(parsed.findings)
-    ? parsed.findings.map((f) => ({
-        issue: typeof f.issue === "string" ? f.issue : "unknown",
-        line: typeof f.line === "string" ? f.line : undefined,
-        detail: typeof f.detail === "string" ? f.detail : "",
-        recommendation: typeof f.recommendation === "string" ? f.recommendation : undefined,
-      }))
-    : [];
-
-  return {
-    check_name: CHECK_NAME,
-    severity: parseSeverityString(parsed.severity),
-    detail: typeof parsed.detail === "string" ? parsed.detail : `${findings.length} findings`,
-    findings,
-    timestamp,
-    model_used: llmResult.model,
-    tokens_used: llmResult.tokens,
-    duration_ms: Date.now() - startMs,
-  };
+    mergeResults(opts: MergeOpts<LlmBootstrapResponse>) {
+      const findings = parseFindings(opts.parsed);
+      return {
+        check_name: CHECK_NAME,
+        severity: parseSeverityString(opts.parsed.severity),
+        detail: typeof opts.parsed.detail === "string"
+          ? opts.parsed.detail
+          : `${findings.length} findings`,
+        findings,
+        timestamp: opts.timestamp,
+        model_used: opts.llmModel,
+        tokens_used: opts.llmTokens,
+        duration_ms: Date.now() - opts.startMs,
+      };
+    },
+  });
 }

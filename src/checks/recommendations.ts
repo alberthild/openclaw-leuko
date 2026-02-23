@@ -6,8 +6,10 @@ import type {
   LeukoStatus,
   LeukoHistory,
   PluginLogger,
-  Severity,
 } from "../types.js";
+import { parseSeverityString } from "../check-utils.js";
+import { runLlmCheck } from "../check-runner.js";
+import type { MergeOpts } from "../check-runner.js";
 
 const CHECK_NAME = "cognitive:recommendations";
 
@@ -46,138 +48,130 @@ interface LlmRecommendationsResponse {
   }>;
 }
 
-function parseLlmResponse(raw: string): LlmRecommendationsResponse | null {
-  try {
-    return JSON.parse(raw) as LlmRecommendationsResponse;
-  } catch {
-    return null;
-  }
-}
-
-function parseSeverityString(v: unknown): Severity {
-  if (v === "ok" || v === "warn" || v === "critical") return v;
-  return "ok";
-}
-
-/**
- * Build a summary of current run findings for the LLM.
- */
 function buildFindingsSummary(
   currentResults: CognitiveCheckResult[],
   status: LeukoStatus | null,
-  history: LeukoHistory | null,
 ): string {
-  const sections: string[] = [];
+  const sections: string[] = ["=== Current Cognitive Check Results ==="];
 
-  // Current cognitive check results
-  sections.push("=== Current Cognitive Check Results ===");
   for (const result of currentResults) {
     sections.push(`${result.check_name}: ${result.severity} — ${result.detail}`);
-    if (result.findings && result.findings.length > 0) {
-      for (const f of result.findings.slice(0, 5)) {
-        sections.push(`  - ${f.issue}: ${f.detail}`);
-      }
-    }
-    if (result.correlations && result.correlations.length > 0) {
-      for (const c of result.correlations.slice(0, 5)) {
-        sections.push(`  - ${c.diagnosis}: ${c.input}=${c.input_value} → ${c.output}=${c.output_value}`);
-      }
-    }
-    if (result.anomalies && result.anomalies.length > 0) {
-      for (const a of result.anomalies.slice(0, 5)) {
-        sections.push(`  - ${a.metric}: ${a.deviation}`);
-      }
-    }
+    appendFindings(result, sections);
+    appendCorrelations(result, sections);
+    appendAnomalies(result, sections);
   }
 
-  // Daemon check issues
-  if (status) {
-    const issues = status.daemon_checks.filter((c) => c.severity !== "ok");
-    if (issues.length > 0) {
-      sections.push("\n=== Current Daemon Issues ===");
-      for (const issue of issues) {
-        sections.push(`${issue.check_name}: ${issue.severity} — ${issue.detail}`);
-      }
-    }
-  }
-
+  appendDaemonIssues(status, sections);
   return sections.join("\n").substring(0, 4000);
 }
+
+function appendFindings(result: CognitiveCheckResult, out: string[]): void {
+  if (!result.findings || result.findings.length === 0) return;
+  for (const f of result.findings.slice(0, 5)) {
+    out.push(`  - ${f.issue}: ${f.detail}`);
+  }
+}
+
+function appendCorrelations(result: CognitiveCheckResult, out: string[]): void {
+  if (!result.correlations || result.correlations.length === 0) return;
+  for (const c of result.correlations.slice(0, 5)) {
+    out.push(`  - ${c.diagnosis}: ${c.input}=${c.input_value} → ${c.output}=${c.output_value}`);
+  }
+}
+
+function appendAnomalies(result: CognitiveCheckResult, out: string[]): void {
+  if (!result.anomalies || result.anomalies.length === 0) return;
+  for (const a of result.anomalies.slice(0, 5)) {
+    out.push(`  - ${a.metric}: ${a.deviation}`);
+  }
+}
+
+function appendDaemonIssues(status: LeukoStatus | null, out: string[]): void {
+  if (!status) return;
+  const issues = status.daemon_checks.filter((c) => c.severity !== "ok");
+  if (issues.length === 0) return;
+  out.push("\n=== Current Daemon Issues ===");
+  for (const issue of issues) {
+    out.push(`${issue.check_name}: ${issue.severity} — ${issue.detail}`);
+  }
+}
+
+function parseRecommendations(
+  parsed: LlmRecommendationsResponse,
+  max: number,
+): Recommendation[] {
+  if (!Array.isArray(parsed.recommendations)) return [];
+  return parsed.recommendations.slice(0, max).map((r) => ({
+    type: typeof r.type === "string" ? r.type : "maintenance",
+    target: typeof r.target === "string" ? r.target : "unknown",
+    reason: typeof r.reason === "string" ? r.reason : "",
+    priority: (r.priority === "low" || r.priority === "medium" || r.priority === "high")
+      ? r.priority
+      : "low" as const,
+  }));
+}
+
+interface RecsInput { summary: string; maxRecs: number }
 
 export async function runRecommendationsCheck(
   config: RecommendationsCheckConfig,
   llm: LlmClient,
   currentResults: CognitiveCheckResult[],
   status: LeukoStatus | null,
-  history: LeukoHistory | null,
+  _history: LeukoHistory | null,
   logger: PluginLogger,
 ): Promise<CognitiveCheckResult> {
-  const startMs = Date.now();
-  const timestamp = new Date().toISOString();
+  return runLlmCheck<RecsInput, LlmRecommendationsResponse>({
+    name: CHECK_NAME,
+    systemPrompt: SYSTEM_PROMPT,
+    llm,
+    logger,
 
-  const summary = buildFindingsSummary(currentResults, status, history);
+    readInput() {
+      const summary = buildFindingsSummary(currentResults, status);
+      return { ok: true, input: { summary, maxRecs: config.maxRecommendations } };
+    },
 
-  const userPrompt = [
-    `Current date: ${new Date().toISOString().split("T")[0]}`,
-    `Maximum recommendations: ${config.maxRecommendations}`,
-    "",
-    summary,
-  ].join("\n");
+    preFilter() {
+      return { severity: "ok", findingCount: 0, data: {} };
+    },
 
-  const llmResult = await llm.generate(SYSTEM_PROMPT, userPrompt, 30000);
+    buildPrompt(input) {
+      return [
+        `Current date: ${new Date().toISOString().split("T")[0]}`,
+        `Maximum recommendations: ${input.maxRecs}`,
+        "",
+        input.summary,
+      ].join("\n");
+    },
 
-  if (llmResult.content === null) {
-    return {
-      check_name: CHECK_NAME,
-      severity: "ok",
-      detail: llmResult.error
-        ? `LLM unavailable (${llmResult.error}) — no recommendations`
-        : "LLM timeout — no recommendations",
-      recommendations: [],
-      timestamp,
-      model_used: llmResult.model,
-      tokens_used: 0,
-      duration_ms: Date.now() - startMs,
-    };
-  }
+    buildFailOpen({ message, llmModel, llmTokens, timestamp, startMs }) {
+      return {
+        check_name: CHECK_NAME,
+        severity: "ok",
+        detail: `${message} — no recommendations`,
+        recommendations: [],
+        timestamp,
+        model_used: llmModel,
+        tokens_used: llmTokens,
+        duration_ms: Date.now() - startMs,
+      };
+    },
 
-  const parsed = parseLlmResponse(llmResult.content);
-  if (!parsed) {
-    return {
-      check_name: CHECK_NAME,
-      severity: "ok",
-      detail: "LLM response parsing failed — no recommendations",
-      recommendations: [],
-      timestamp,
-      model_used: llmResult.model,
-      tokens_used: llmResult.tokens,
-      duration_ms: Date.now() - startMs,
-    };
-  }
-
-  const recommendations: Recommendation[] = Array.isArray(parsed.recommendations)
-    ? parsed.recommendations
-        .slice(0, config.maxRecommendations)
-        .map((r) => ({
-          type: typeof r.type === "string" ? r.type : "maintenance",
-          target: typeof r.target === "string" ? r.target : "unknown",
-          reason: typeof r.reason === "string" ? r.reason : "",
-          priority: (r.priority === "low" || r.priority === "medium" || r.priority === "high")
-            ? r.priority
-            : "low" as const,
-        }))
-    : [];
-
-  return {
-    check_name: CHECK_NAME,
-    severity: parseSeverityString(parsed.severity),
-    detail: typeof parsed.detail === "string"
-      ? parsed.detail
-      : `${recommendations.length} recommendations generated`,
-    recommendations,
-    timestamp,
-    model_used: llmResult.model,
-    tokens_used: llmResult.tokens,
-    duration_ms: Date.now() - startMs,
-  };
+    mergeResults(opts: MergeOpts<LlmRecommendationsResponse>) {
+      const recs = parseRecommendations(opts.parsed, config.maxRecommendations);
+      return {
+        check_name: CHECK_NAME,
+        severity: parseSeverityString(opts.parsed.severity),
+        detail: typeof opts.parsed.detail === "string"
+          ? opts.parsed.detail
+          : `${recs.length} recommendations generated`,
+        recommendations: recs,
+        timestamp: opts.timestamp,
+        model_used: opts.llmModel,
+        tokens_used: opts.llmTokens,
+        duration_ms: Date.now() - opts.startMs,
+      };
+    },
+  });
 }
