@@ -45,6 +45,7 @@ function sendHttpRequest(
   logger: PluginLogger,
 ): Promise<RawCompletion> {
   return new Promise((resolve) => {
+    const startMs = Date.now();
     try {
       const url = new URL(buildEndpoint(config.baseUrl));
       const body = buildRequestBody(config.model, systemPrompt, userPrompt);
@@ -76,7 +77,7 @@ function sendHttpRequest(
       });
       req.on("timeout", () => {
         req.destroy();
-        const elapsed = Date.now();
+        const elapsed = Date.now() - startMs;
         logger.debug(`[leuko-llm] Timeout after ${elapsed}ms`);
         resolve({ content: null, tokens: 0, error: `Timeout after ${elapsed}ms` });
       });
