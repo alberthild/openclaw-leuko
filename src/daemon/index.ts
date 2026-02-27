@@ -11,9 +11,10 @@
  *   npx @vainplex/openclaw-leuko daemon --config /path/to/config.json
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { createConnection } from "node:net";
 
 // ============================================================
 // Types
@@ -152,18 +153,21 @@ function checkFileFreshness(targets: FreshnessTarget[]): DaemonCheck[] {
 }
 
 function checkGatewayAlive(): DaemonCheck {
-  try {
-    const output = execSync("pgrep -f openclaw-gateway || pgrep -f openclaw", {
-      timeout: 5000,
-      encoding: "utf-8",
-    }).trim();
-    if (output) {
-      return check("gateway_alive", "ok", `Gateway process found (PID: ${output.split("\n")[0]})`);
+  // Try openclaw-gateway first, then openclaw
+  for (const pattern of ["openclaw-gateway", "openclaw"]) {
+    try {
+      const output = execFileSync("pgrep", ["-f", pattern], {
+        timeout: 5000,
+        encoding: "utf-8",
+      }).trim();
+      if (output) {
+        return check("gateway_alive", "ok", `Gateway process found (PID: ${output.split("\n")[0]})`);
+      }
+    } catch {
+      // pgrep exits non-zero when no match — continue
     }
-    return check("gateway_alive", "critical", "No OpenClaw gateway process found");
-  } catch {
-    return check("gateway_alive", "critical", "No OpenClaw gateway process found");
   }
+  return check("gateway_alive", "critical", "No OpenClaw gateway process found");
 }
 
 function checkPluginLoading(): DaemonCheck {
@@ -185,8 +189,11 @@ function checkPluginLoading(): DaemonCheck {
 
 function checkDiskUsage(warnPct: number, critPct: number): DaemonCheck {
   try {
-    const output = execSync("df -h / | tail -1", { timeout: 5000, encoding: "utf-8" }).trim();
-    const match = output.match(/(\d+)%/);
+    const output = execFileSync("df", ["-h", "/"], { timeout: 5000, encoding: "utf-8" }).trim();
+    // Take last line (skip header)
+    const lines = output.split("\n");
+    const lastLine = lines[lines.length - 1] ?? "";
+    const match = lastLine.match(/(\d+)%/);
     if (match) {
       const pct = parseInt(match[1]!, 10);
       if (pct >= critPct) return check("disk_usage", "critical", `Disk ${pct}% full`);
@@ -199,19 +206,55 @@ function checkDiskUsage(warnPct: number, critPct: number): DaemonCheck {
   }
 }
 
+/**
+ * TCP probe using Node.js net module — no shell involved.
+ */
+function tcpProbe(host: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = createConnection({ host, port }, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.setTimeout(timeoutMs);
+    sock.on("timeout", () => { sock.destroy(); resolve(false); });
+    sock.on("error", () => { sock.destroy(); resolve(false); });
+  });
+}
+
+/**
+ * HTTP probe using execFileSync with curl (no shell interpolation).
+ */
+function httpProbe(url: string, timeoutMs: number): boolean {
+  try {
+    execFileSync("curl", ["-sf", "--max-time", String(Math.ceil(timeoutMs / 1000)), url], {
+      timeout: timeoutMs + 2000,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function checkServiceHealth(endpoints: ServiceEndpoint[]): DaemonCheck[] {
   const results: DaemonCheck[] = [];
   for (const ep of endpoints) {
     if (ep.type === "http" && ep.url) {
-      try {
-        execSync(`curl -sf --max-time 3 "${ep.url}" > /dev/null 2>&1`, { timeout: 5000 });
-        results.push(check(`service:${ep.name}`, "ok", `${ep.name} reachable`));
-      } catch {
-        results.push(check(`service:${ep.name}`, "warn", `${ep.name} unreachable at ${ep.url}`));
-      }
+      const ok = httpProbe(ep.url, ep.timeoutMs);
+      results.push(check(`service:${ep.name}`, ok ? "ok" : "warn",
+        ok ? `${ep.name} reachable` : `${ep.name} unreachable at ${ep.url}`));
     } else if (ep.type === "tcp" && ep.host && ep.port) {
+      // Validate host/port to prevent any funny business
+      if (!/^[\w.\-]+$/.test(ep.host) || ep.port < 1 || ep.port > 65535) {
+        results.push(check(`service:${ep.name}`, "warn", `Invalid host/port: ${ep.host}:${ep.port}`));
+        continue;
+      }
+      // TCP probe is async — use sync wrapper for daemon context
+      // Fall back to execFileSync with timeout utility (no shell)
       try {
-        execSync(`timeout 3 bash -c 'echo > /dev/tcp/${ep.host}/${ep.port}' 2>/dev/null`, { timeout: 5000 });
+        execFileSync("node", ["-e",
+          `const s=require("net").createConnection({host:${JSON.stringify(ep.host)},port:${ep.port}},()=>{s.destroy();process.exit(0)});s.setTimeout(${ep.timeoutMs});s.on("timeout",()=>{s.destroy();process.exit(1)});s.on("error",()=>{s.destroy();process.exit(1)})`
+        ], { timeout: ep.timeoutMs + 2000, stdio: "ignore" });
         results.push(check(`service:${ep.name}`, "ok", `${ep.name} reachable at ${ep.host}:${ep.port}`));
       } catch {
         results.push(check(`service:${ep.name}`, "warn", `${ep.name} unreachable at ${ep.host}:${ep.port}`));
@@ -315,32 +358,69 @@ function writeStatus(status: StatusFile, path: string): void {
 }
 
 // ============================================================
+// Exports (for testing)
+// ============================================================
+
+export {
+  runDaemon,
+  loadDaemonConfig,
+  writeStatus,
+  defaultConfig,
+  checkFileFreshness,
+  checkGatewayAlive,
+  checkPluginLoading,
+  checkDiskUsage,
+  checkServiceHealth,
+  autoDiscoverFreshnessTargets,
+  httpProbe,
+  tcpProbe,
+  check,
+  hoursAgo,
+};
+
+export type { DaemonCheck, StatusFile, DaemonConfig, FreshnessTarget, ServiceEndpoint };
+
+// ============================================================
 // CLI
 // ============================================================
 
-const args = process.argv.slice(2);
-const watchMode = args.includes("--watch");
-const configIdx = args.indexOf("--config");
-const configPath = configIdx >= 0 ? args[configIdx + 1] : undefined;
+export function main(argv: string[] = process.argv.slice(2)): void {
+  const watchMode = argv.includes("--watch");
+  const configIdx = argv.indexOf("--config");
+  const configPath = configIdx >= 0 ? argv[configIdx + 1] : undefined;
 
-const cfg = loadDaemonConfig(configPath);
+  const cfg = loadDaemonConfig(configPath);
 
-console.log(`[leuko-daemon] Workspace: ${cfg.workspace}`);
-console.log(`[leuko-daemon] Status output: ${cfg.statusPath}`);
+  // Validate watch interval
+  if (cfg.watchIntervalMin < 1) cfg.watchIntervalMin = 1;
+  if (cfg.watchIntervalMin > 1440) cfg.watchIntervalMin = 1440;
 
-function tick() {
-  const t0 = Date.now();
-  const status = runDaemon(cfg);
-  writeStatus(status, cfg.statusPath);
-  const ms = Date.now() - t0;
-  const warn = status.daemon_checks.filter(c => c.severity === "warn").length;
-  const crit = status.daemon_checks.filter(c => c.severity === "critical").length;
-  console.log(`[leuko-daemon] ${status.overall_severity.toUpperCase()} — ${status.daemon_checks.length} checks (${warn} warn, ${crit} crit) in ${ms}ms`);
+  console.log(`[leuko-daemon] Workspace: ${cfg.workspace}`);
+  console.log(`[leuko-daemon] Status output: ${cfg.statusPath}`);
+
+  function tick() {
+    const t0 = Date.now();
+    const status = runDaemon(cfg);
+    writeStatus(status, cfg.statusPath);
+    const ms = Date.now() - t0;
+    const warn = status.daemon_checks.filter(c => c.severity === "warn").length;
+    const crit = status.daemon_checks.filter(c => c.severity === "critical").length;
+    console.log(`[leuko-daemon] ${status.overall_severity.toUpperCase()} — ${status.daemon_checks.length} checks (${warn} warn, ${crit} crit) in ${ms}ms`);
+  }
+
+  tick();
+
+  if (watchMode) {
+    console.log(`[leuko-daemon] Watch mode: running every ${cfg.watchIntervalMin} minutes`);
+    setInterval(tick, cfg.watchIntervalMin * 60 * 1000);
+  }
 }
 
-tick();
+// Only run CLI when executed directly (not imported for tests)
+const isDirectExecution = process.argv[1]?.endsWith("daemon/index.js") ||
+  process.argv[1]?.endsWith("daemon/index.ts") ||
+  process.argv[1]?.endsWith("leuko-daemon");
 
-if (watchMode) {
-  console.log(`[leuko-daemon] Watch mode: running every ${cfg.watchIntervalMin} minutes`);
-  setInterval(tick, cfg.watchIntervalMin * 60 * 1000);
+if (isDirectExecution) {
+  main();
 }
