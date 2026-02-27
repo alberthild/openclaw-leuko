@@ -8,20 +8,90 @@ Part of the [Vainplex OpenClaw Plugin Suite](https://github.com/alberthild/vainp
 
 Leuko operates as a **two-tier hybrid system**:
 
-- **Level 1 (Python daemon):** Heuristic checks — file freshness, JSON validity, service connectivity, cron health. Runs every 15min, zero API cost.
-- **Level 2 (This plugin):** Cognitive checks — semantic analysis via LLM + deterministic correlation. Runs every 2h or on-demand.
+- **Level 1 (L1 Daemon):** Heuristic checks — file freshness, gateway alive, plugin loading, disk usage, service health. Runs every 15min, zero API cost. **Included in this package** since v0.2.0.
+- **Level 2 (L2 Plugin):** Cognitive checks — semantic analysis via LLM + deterministic correlation. Runs every 2h or on-demand.
 
 ```
-                  Plugin (L2)                    Agents
-                       │                           │
-  ┌─ Read daemon_checks[] from leuko-status.json   │
-  ├─ Run CK-01..CK-06 (4 LLM + 2 deterministic)   │
-  ├─ Write cognitive_checks[] to leuko-status.json  │
-  │                                                 │
-  ├── leuko_status tool ────────────────────────────┤
-  ├── before_agent_start hook ──────────────────────┤
-  └── /leuko command ──────────────────────────────→│
+  L1 Daemon (Node.js)        Plugin (L2)                    Agents
+        │                         │                           │
+  ┌─ 7 heuristic checks          │                           │
+  ├─ Write daemon_checks[]        │                           │
+  │  to leuko-status.json         │                           │
+  │                    ┌──────────┘                           │
+  │                    ├─ Read daemon_checks[]                │
+  │                    ├─ Run CK-01..CK-06 (4 LLM + 2 det.) │
+  │                    ├─ Write cognitive_checks[]            │
+  │                    │                                      │
+  │                    ├── leuko_status tool ─────────────────┤
+  │                    ├── before_agent_start hook ───────────┤
+  │                    └── /leuko command ───────────────────→│
+  │                                                           │
+  └── npx leuko-daemon [--watch] (standalone)                 │
 ```
+
+## L1 Daemon
+
+The L1 daemon is a portable Node.js process that produces `leuko-status.json` — no Python, no NATS, no external dependencies required.
+
+### Usage
+
+```bash
+# Run once
+npx @vainplex/openclaw-leuko daemon
+
+# Watch mode (re-check every 15min)
+npx @vainplex/openclaw-leuko daemon --watch
+
+# Custom config
+npx @vainplex/openclaw-leuko daemon --config /path/to/daemon-config.json
+```
+
+Or via the `leuko-daemon` binary after global install:
+
+```bash
+npm install -g @vainplex/openclaw-leuko
+leuko-daemon --watch
+```
+
+### L1 Checks
+
+| Check | What it does |
+|-------|-------------|
+| File Freshness | Monitors key files (BOOTSTRAP.md, threads.json, etc.) for staleness |
+| Gateway Alive | Verifies OpenClaw gateway process is running |
+| Plugin Loading | Reads `openclaw.json` and counts enabled plugins |
+| Disk Usage | Warns at configurable thresholds (default: 85% warn, 95% crit) |
+| Service Health | HTTP/TCP probes for configured endpoints |
+
+Auto-discovers workspace by looking for `.openclaw/` or `AGENTS.md`.
+
+### Daemon Config
+
+Optional JSON config file:
+
+```json
+{
+  "statusPath": "~/.openclaw/leuko-status.json",
+  "workspace": "~/clawd",
+  "watchIntervalMin": 15,
+  "checks": {
+    "file_freshness": {
+      "targets": [
+        { "name": "boot-context", "path": "~/clawd/BOOTSTRAP.md", "warnHours": 4, "critHours": 8 }
+      ]
+    },
+    "service_health": {
+      "endpoints": [
+        { "name": "nats", "type": "tcp", "host": "localhost", "port": 4222, "timeoutMs": 3000 },
+        { "name": "ollama", "type": "http", "url": "http://localhost:11434/api/tags", "timeoutMs": 3000 }
+      ]
+    },
+    "disk_usage": { "warnPercent": 85, "critPercent": 95 }
+  }
+}
+```
+
+If no config is provided, freshness targets are auto-discovered from the workspace.
 
 ## Quick Start
 
