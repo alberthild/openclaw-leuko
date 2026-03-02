@@ -1,5 +1,8 @@
 # @vainplex/openclaw-leuko
 
+[![npm](https://img.shields.io/npm/v/@vainplex/openclaw-leuko)](https://www.npmjs.com/package/@vainplex/openclaw-leuko)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **Cognitive immune system for OpenClaw** — L2 semantic health checks with LLM analysis, tool exposure for agent queries, and Sitrep replacement.
 
 Part of the [Vainplex OpenClaw Plugin Suite](https://github.com/alberthild/vainplex-openclaw).
@@ -8,7 +11,7 @@ Part of the [Vainplex OpenClaw Plugin Suite](https://github.com/alberthild/vainp
 
 Leuko operates as a **two-tier hybrid system**:
 
-- **Level 1 (L1 Daemon):** Heuristic checks — file freshness, gateway alive, plugin loading, disk usage, service health. Runs every 15min, zero API cost. **Included in this package** since v0.2.0.
+- **Level 1 (L1 Daemon):** Heuristic checks — file freshness, gateway alive, plugin loading, disk usage, service health. Runs every 15min, zero API cost. **Included in this package.**
 - **Level 2 (L2 Plugin):** Cognitive checks — semantic analysis via LLM + deterministic correlation. Runs every 2h or on-demand.
 
 ```
