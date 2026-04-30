@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { statSync, existsSync } from "node:fs";
 import type {
   CognitiveCheckResult,
@@ -13,28 +12,13 @@ import { worstSeverity } from "../check-utils.js";
 const CHECK_NAME = "cognitive:pipeline_correlation";
 
 /**
- * Try to get NATS stream message count via CLI.
- * Returns null if nats CLI not available or fails.
+ * NATS message count is supplied by the caller when available.
+ * We intentionally avoid spawning the `nats` CLI inside the plugin runtime.
  */
-function getNatsEventCount(stream: string, logger: PluginLogger): number | null {
-  try {
-    const result = execFileSync("nats", ["stream", "info", stream, "--json"], {
-      timeout: 5000,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const parsed: unknown = JSON.parse(result);
-    if (typeof parsed !== "object" || parsed === null) return null;
-    const state = (parsed as Record<string, unknown>)["state"];
-    if (typeof state === "object" && state !== null) {
-      const msgs = (state as Record<string, unknown>)["messages"];
-      if (typeof msgs === "number") return msgs;
-    }
-    return null;
-  } catch {
-    logger.debug("[leuko] NATS CLI not available or stream not found");
-    return null;
-  }
+function getNatsEventCount(_stream: string, logger: PluginLogger, injected?: number | null): number | null {
+  if (typeof injected === "number") return injected;
+  logger.debug("[leuko] NATS message count unavailable (no subprocess fallback)");
+  return null;
 }
 
 function fileAgeHours(path: string): number | null {
@@ -66,6 +50,7 @@ function getCronStatus(daemonChecks: LeukoStatus["daemon_checks"]): CronStatus {
 export interface PipelineCorrelationDeps {
   threadsPath: string;
   daemonChecks: LeukoStatus["daemon_checks"];
+  natsTotalMessages?: number | null;
 }
 
 interface PipelineSignals {
@@ -81,7 +66,7 @@ function gatherSignals(
   logger: PluginLogger,
 ): PipelineSignals {
   return {
-    natsTotal: getNatsEventCount(config.natsStream, logger),
+    natsTotal: getNatsEventCount(config.natsStream, logger, deps.natsTotalMessages),
     threadsAgeH: fileAgeHours(deps.threadsPath),
     cronStatus: getCronStatus(deps.daemonChecks),
     inBusinessHours: isBusinessHours(config.businessHours),

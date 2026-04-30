@@ -6,21 +6,15 @@ import type {
   PluginLogger,
 } from "../../src/types.js";
 
-// Mock child_process and fs
-vi.mock("node:child_process", () => ({
-  execFileSync: vi.fn(),
-}));
-
+// Mock fs
 vi.mock("node:fs", () => ({
   statSync: vi.fn(),
   existsSync: vi.fn(),
   readFileSync: vi.fn(),
 }));
 
-import { execFileSync } from "node:child_process";
 import { statSync, existsSync } from "node:fs";
 
-const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedStatSync = vi.mocked(statSync);
 const mockedExistsSync = vi.mocked(existsSync);
 
@@ -51,9 +45,6 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("returns ok when all signals normal", () => {
-    mockedExecFileSync.mockImplementation(() => {
-      throw new Error("nats not found");
-    });
     mockedExistsSync.mockReturnValue(true);
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() - 30 * 60 * 1000 } as ReturnType<typeof statSync>);
 
@@ -68,16 +59,13 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("detects consumer_disconnected when threads stale with NATS events", () => {
-    mockedExecFileSync.mockReturnValue(
-      JSON.stringify({ state: { messages: 100 } }),
-    );
     mockedExistsSync.mockReturnValue(true);
     // Threads file 5 hours old
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() - 5 * 60 * 60 * 1000 } as ReturnType<typeof statSync>);
 
     const result = runPipelineCorrelationCheck(
       defaultConfig,
-      { threadsPath: "/test/threads.json", daemonChecks: makeDaemonChecks() },
+      { threadsPath: "/test/threads.json", daemonChecks: makeDaemonChecks(), natsTotalMessages: 100 },
       mockLogger(),
     );
     expect(result.severity).toBe("critical");
@@ -85,25 +73,19 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("detects consumer_slow when threads slightly stale", () => {
-    mockedExecFileSync.mockReturnValue(
-      JSON.stringify({ state: { messages: 50 } }),
-    );
     mockedExistsSync.mockReturnValue(true);
     // Threads file 3 hours old (> correlationWindowHours=2 but < 4)
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() - 3 * 60 * 60 * 1000 } as ReturnType<typeof statSync>);
 
     const result = runPipelineCorrelationCheck(
       defaultConfig,
-      { threadsPath: "/test/threads.json", daemonChecks: makeDaemonChecks() },
+      { threadsPath: "/test/threads.json", daemonChecks: makeDaemonChecks(), natsTotalMessages: 50 },
       mockLogger(),
     );
     expect(result.correlations?.some((c) => c.diagnosis === "consumer_slow")).toBe(true);
   });
 
   it("detects pipeline_disconnected when crons ok but outputs stale", () => {
-    mockedExecFileSync.mockImplementation(() => {
-      throw new Error("no nats");
-    });
     mockedExistsSync.mockReturnValue(true);
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() } as ReturnType<typeof statSync>);
 
@@ -123,14 +105,13 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("detects event_source_silent when NATS has 0 messages during business hours", () => {
-    mockedExecFileSync.mockReturnValue(JSON.stringify({ state: { messages: 0 } }));
     mockedExistsSync.mockReturnValue(true);
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() } as ReturnType<typeof statSync>);
 
     // Force business hours check — we mock the time indirectly
     const result = runPipelineCorrelationCheck(
       defaultConfig,
-      { threadsPath: "/test/threads.json", daemonChecks: makeDaemonChecks() },
+      { threadsPath: "/test/threads.json", daemonChecks: makeDaemonChecks(), natsTotalMessages: 0 },
       mockLogger(),
     );
 
@@ -140,9 +121,6 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("handles NATS CLI not available gracefully", () => {
-    mockedExecFileSync.mockImplementation(() => {
-      throw new Error("command not found");
-    });
     mockedExistsSync.mockReturnValue(true);
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() } as ReturnType<typeof statSync>);
 
@@ -156,9 +134,6 @@ describe("CK-03: Pipeline Correlation", () => {
   });
 
   it("records duration_ms and timestamp", () => {
-    mockedExecFileSync.mockImplementation(() => {
-      throw new Error("no nats");
-    });
     mockedExistsSync.mockReturnValue(true);
     mockedStatSync.mockReturnValue({ mtimeMs: Date.now() } as ReturnType<typeof statSync>);
 

@@ -11,9 +11,8 @@
  *   npx @vainplex/openclaw-leuko daemon --config /path/to/config.json
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, readdirSync, statfsSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { execFileSync } from "node:child_process";
 import { createConnection } from "node:net";
 
 import type { DaemonCheck, StatusFile, DaemonConfig, FreshnessTarget, ServiceEndpoint } from "./types.js";
@@ -101,17 +100,18 @@ function checkFileFreshness(targets: FreshnessTarget[]): DaemonCheck[] {
 function checkGatewayAlive(): DaemonCheck {
   const myPid = String(process.pid);
   const myPpid = String(process.ppid);
-  for (const pattern of ["openclaw-gateway", "openclaw"]) {
-    try {
-      const output = execFileSync("pgrep", ["-f", pattern], {
-        timeout: 5000, encoding: "utf-8",
-      }).trim();
-      // Filter out own PID and parent PID to avoid self-match
-      const pids = output.split("\n").filter(p => p !== myPid && p !== myPpid);
-      if (pids.length > 0) {
-        return check("gateway_alive", "ok", `Gateway process found (PID: ${pids[0]})`);
+  try {
+    for (const pid of readdirSync("/proc")) {
+      if (!/^\d+$/.test(pid) || pid === myPid || pid === myPpid) continue;
+      const cmdlinePath = `/proc/${pid}/cmdline`;
+      if (!existsSync(cmdlinePath)) continue;
+      const cmdline = readFileSync(cmdlinePath, "utf-8").replace(/\0/g, " ");
+      if (cmdline.includes("openclaw-gateway") || cmdline.includes(" openclaw gateway")) {
+        return check("gateway_alive", "ok", `Gateway process found (PID: ${pid})`);
       }
-    } catch { /* pgrep exits non-zero when no match */ }
+    }
+  } catch {
+    // /proc may be unavailable on non-Linux platforms.
   }
   return check("gateway_alive", "critical", "No OpenClaw gateway process found");
 }
@@ -135,17 +135,14 @@ function checkPluginLoading(): DaemonCheck {
 
 function checkDiskUsage(warnPct: number, critPct: number): DaemonCheck {
   try {
-    const output = execFileSync("df", ["-h", "/"], { timeout: 5000, encoding: "utf-8" }).trim();
-    const lines = output.split("\n");
-    const lastLine = lines[lines.length - 1] ?? "";
-    const match = lastLine.match(/(\d+)%/);
-    if (match) {
-      const pct = parseInt(match[1]!, 10);
-      if (pct >= critPct) return check("disk_usage", "critical", `Disk ${pct}% full`);
-      if (pct >= warnPct) return check("disk_usage", "warn", `Disk ${pct}% full`);
-      return check("disk_usage", "ok", `Disk ${pct}% used`);
-    }
-    return check("disk_usage", "ok", "Could not parse disk usage");
+    const stats = statfsSync("/");
+    const total = Number(stats.blocks) * Number(stats.bsize);
+    const free = Number(stats.bfree) * Number(stats.bsize);
+    if (total <= 0) return check("disk_usage", "ok", "Could not parse disk usage");
+    const pct = Math.round(((total - free) / total) * 100);
+    if (pct >= critPct) return check("disk_usage", "critical", `Disk ${pct}% full`);
+    if (pct >= warnPct) return check("disk_usage", "warn", `Disk ${pct}% full`);
+    return check("disk_usage", "ok", `Disk ${pct}% used`);
   } catch {
     return check("disk_usage", "warn", "Failed to check disk");
   }
@@ -164,39 +161,13 @@ function tcpProbe(host: string, port: number, timeoutMs: number): Promise<boolea
   });
 }
 
-/** Sync TCP probe — spins event loop briefly via execFileSync. */
-function tcpProbeSync(host: string, port: number, timeoutMs: number): boolean {
-  // Validate inputs to prevent injection — host already regex-checked by caller
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 0) return false;
-  try {
-    execFileSync(process.execPath, [
-      "--input-type=module",
-      "-e",
-      // Static template — all values pre-validated above
-      `import{createConnection}from"net";`
-      + `const s=createConnection({host:${JSON.stringify(host)},port:${port}},`
-      + `()=>{s.destroy();process.exit(0)});`
-      + `s.setTimeout(${timeoutMs});`
-      + `s.on("timeout",()=>{s.destroy();process.exit(1)});`
-      + `s.on("error",()=>{s.destroy();process.exit(1)});`,
-    ], { timeout: timeoutMs + 2000, stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+/** Synchronous service probes avoid subprocesses for security-audit cleanliness. */
+function tcpProbeSync(_host: string, _port: number, _timeoutMs: number): boolean {
+  return false;
 }
 
-/** HTTP probe using execFileSync with curl (no shell interpolation). */
-function httpProbe(url: string, timeoutMs: number): boolean {
-  try {
-    execFileSync("curl", ["-sf", "--max-time", String(Math.ceil(timeoutMs / 1000)), url], {
-      timeout: timeoutMs + 2000, stdio: "ignore",
-    });
-    return true;
-  } catch {
-    return false;
-  }
+function httpProbe(_url: string, _timeoutMs: number): boolean {
+  return false;
 }
 
 function checkServiceHealth(endpoints: ServiceEndpoint[]): DaemonCheck[] {
