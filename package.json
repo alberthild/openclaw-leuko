@@ -1,6 +1,6 @@
 {
   "name": "@vainplex/openclaw-leuko",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Cognitive immune system — L2 semantic health checks with LLM analysis, tool exposure for agent queries, and Sitrep replacement",
   "type": "module",
   "main": "dist/src/index.js",
